@@ -1,6 +1,6 @@
 #!/bin/sh
 #
-# CC0 - Konrad Förstner <konrad@foerstner>, 2020
+# CC0 - Konrad Förstner <konrad@foerstner>, 2020 - 2022
 # https://creativecommons.org/publicdomain/zero/1.0/legalcode.txt
 # 
 # The code was build using the following sources:
@@ -34,14 +34,13 @@ set -o pipefail
 main(){
     # Use lsblk - to show available discs
     # Set!
-    readonly DISK=/dev/sda  # e.g /dev/sda or /dev/nvme0n1
+    readonly DISK=/dev/nvme0n1  # e.g /dev/sda or /dev/nvme0n1
     readonly USER_NAME=my_awesome_user_name
     readonly SWAP_SIZE=16G
-    # readonly LUKS_PASSWORD="XXX" # TODO - does not work    
-    
-    readonly BOOT_PARTITION=${DISK}1
-    readonly LVM_PARTITION=${DISK}2
-    readonly SYSTEM_VOLUME=${DISK}2p2 # maybe needs adapation
+    # readonly LUKS_PASSWORD="XXX" # TODO - does not work
+
+    readonly BOOT_PARTITION=${DISK}p1
+    readonly LVM_PARTITION=${DISK}p2
     readonly TMP_CONFIG_PATH=/mnt/etc/nixos/configuration.nix
 
     if [ ${#@} -eq 0 ]
