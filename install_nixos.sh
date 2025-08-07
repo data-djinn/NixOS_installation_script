@@ -1,228 +1,181 @@
-#!/bin/sh
-#
-# CC0 - Konrad Förstner <konrad@foerstner>, 2020 - 2022
+#!/usr/bin/env bash
+# Btrfs erase-your-darlings NixOS installer
+# CAUTION: THIS SCRIPT WILL NUKE YOUR HARD DRIVE. DO NOT USE IF YOU WISH TO RETAIN DATA
+# Initially forked from:
+# CC0 - Konrad Förstner <konrad@foerstner>
 # https://creativecommons.org/publicdomain/zero/1.0/legalcode.txt
-# 
-# The code was build using the following sources:
-# - https://qfpl.io/posts/installing-nixos/ 
-# - https://discourse.nixos.org/t/nixos-on-luks-encrypted-partition-with-zfs-and-swap/6873/4
-# - https://www.rodsbooks.com/gdisk/sgdisk-walkthrough.html
-# - https://fedoramagazine.org/managing-partitions-with-sgdisk/
-# - https://linuxconfig.org/list-of-filesystem-partition-type-codes
 #
-# Structure for the disc
-# - partion 1 => Boot
-# - partition 2 => LVM (LUKS Container)
-#    cryptroot
-#   - lvmvg-swap - swap
-#   - lvmvg-root - system
-#
-# e.g.
-# $ lsblk
-# NAME                 MAJ:MIN RM  SIZE RO TYPE  MOUNTPOINT
-# nvme0n1              259:0    0  1.8T  0 disk  
-# ├─nvme0n1p1          259:1    0    1G  0 part  /boot
-# └─nvme0n1p2          259:2    0  1.8T  0 part  
-#   └─root             254:0    0  1.8T  0 crypt 
-#     ├─nixos--vg-swap  254:1    0   16G  0 lvm   [SWAP]
-#     └─nixos--vg-root 254:2    0  1.8T  0 lvm   /
+# Inspired by: https://mt-caret.github.io/blog/posts/2020-06-29-optin-state.html
+# Public-domain.
 
-set -o errexit
-set -o nounset
-set -o pipefail
+set -euo pipefail
 
-main(){
-    # Use lsblk - to show available discs
-    # Set!
-    readonly DISK=/dev/nvme0n1  # e.g /dev/sda or /dev/nvme0n1
-    readonly USER_NAME=my_awesome_user_name
-    readonly SWAP_SIZE=16G
-    # readonly LUKS_PASSWORD="XXX" # TODO - does not work
+###############################################################################
+# YOU PROBABLY ONLY NEED TO CHANGE THESE THREE LINES
+###############################################################################
+DISK=/dev/nvme0n1              # target disk (hard drives will be like "dev/sda")
+HOSTNAME="nixos-btrfs"         # hostname to write into configuration.nix
+USERNAME="sean"                # your first user
 
-    readonly BOOT_PARTITION=${DISK}p1
-    readonly LVM_PARTITION=${DISK}p2
-    readonly TMP_CONFIG_PATH=/mnt/etc/nixos/configuration.nix
+###############################################################################
+# STATIC CONSTANTS – LEAVE ALONE UNLESS YOU KNOW WHAT YOU’RE DOING
+###############################################################################
+BOOT_PART=${DISK}p1
+CRYPT_PART=${DISK}p2
+CRYPT_NAME=cryptroot
+TMP_CFG=/mnt/etc/nixos/configuration.nix
 
-    if [ ${#@} -eq 0 ]
-    then
-	print_help
-    else for FUNCTION in "$@"
-	 do
-	     "${FUNCTION}"
-	 done
-    fi
+###############################################################################
+print_help() {
+  echo "Usage: $0 <stage>"
+  echo "Stages:"
+  echo "  partitions   – wipe disk and create EFI + LUKS partitions"
+  echo "  luks         – initialise LUKS and open it as /dev/mapper/${CRYPT_NAME}"
+  echo "  format       – create Btrfs fs and subvolumes"
+  echo "  mount        – mount subvolumes and generate Nix config"
+  echo "  patch_cfg    – rewrite config for erase-your-darlings"
+  echo "  install      – nixos-install && reboot"
+  echo "  all          – run EVERYTHING (danger: will nuke ${DISK})"
 }
 
-print_help(){
-    echo "Specify function to call - options:"
-    echo "- generate_partitions"
-    echo "- generate_luks_volume_and_format"
-    echo "- mount_fs_and_generate_config"
-    echo "- adapt_config"
-    echo "- install_nixos"
-    echo ""
-    echo "or use 'all' to run all the functions"
-    echo ""
-    echo "Make sure the variable in the script are properly set!"
+###############################################################################
+partitions() {
+  echo ">>> Partitioning ${DISK}"
+  wipefs -af "${DISK}"
+  sgdisk -Zo "${DISK}"
+  # EFI (1 GiB)
+  sgdisk -n 1:0:+1G   -t 1:EF00 "${DISK}"
+  # LUKS container – rest of the disk
+  sgdisk -n 2:0:0     -t 2:8300 "${DISK}"
 }
 
-all(){
-    generate_partitions
-    generate_luks_volume_and_format
-    mount_fs_and_generate_config
-    adapt_config
-    install_nixos
+luks() {
+  echo ">>> Setting up LUKS on ${CRYPT_PART}"
+  cryptsetup luksFormat --type luks2 "${CRYPT_PART}"
+  cryptsetup open "${CRYPT_PART}" "${CRYPT_NAME}"
 }
 
-generate_partitions(){
+format() {
+  echo ">>> Formatting Btrfs and creating subvolumes"
+  mkfs.vfat -n EFI "${BOOT_PART}"
+  mkfs.btrfs -L nixos /dev/mapper/${CRYPT_NAME}
 
-    echo "Generate partitions"
-    
-    # Remove previous partitions
-    wipefs -af "$DISK"
-    sgdisk -Zo "$DISK"
-
-    # Important for understanding this : For the tool sgdisk the "0"
-    # has a special meaning as described here:
-    # https://fedoramagazine.org/managing-partitions-with-sgdisk/
-    # - partition number field: 0 is placeholder for next available
-    #   number (starts at 1)
-    # - starting address field: 0 start of the largest available block
-    #   of free space
-    # - ending address field: 0 is placeholder for the end of the
-    #   largest available block of free
-
-    # Create EFI boot partition
-    sgdisk -n 0:0:+1G -t 0:EF00 ${DISK}
-
-    # Create LVM partition
-    sgdisk -n 0:0:0 -t 0:8e00 ${DISK}
+  # Mount once to create subvolumes, then unmount.
+  mount /dev/mapper/${CRYPT_NAME} /mnt
+  btrfs subvolume create /mnt/@root
+  btrfs subvolume create /mnt/@nix
+  btrfs subvolume create /mnt/@persist
+  btrfs subvolume create /mnt/@log
+  umount /mnt
 }
 
-generate_luks_volume_and_format(){
+mount() {
+  echo ">>> Mounting subvolumes"
+  mount -o subvol=@root,compress=zstd,noatime /dev/mapper/${CRYPT_NAME} /mnt
+  mkdir -p /mnt/{boot,nix,persist,var/log}
+  mount -o subvol=@nix,compress=zstd,noatime  /dev/mapper/${CRYPT_NAME} /mnt/nix
+  mount -o subvol=@persist,compress=zstd,noatime /dev/mapper/${CRYPT_NAME} /mnt/persist
+  mount -o subvol=@log,compress=zstd,noatime /dev/mapper/${CRYPT_NAME} /mnt/var/log
+  mount "${BOOT_PART}" /mnt/boot
 
-    echo "Generate LUKS volumes and format them"
-    
-    # Generatee LUKS volume
-    ### TODO: Use password stored in a variable
-    ### echo "${LUKS_PASSWORD}" | cryptsetup luksFormat ${LVM_PARTITION} - # Does not work
-    cryptsetup luksFormat ${LVM_PARTITION}
-    
-    # Decrypt the encrypted partition and call it nixos-enc. The
-    # decrypted partition will get mounted at /dev/mapper/nixos-enc
-    ### TODO: Use password stored in a variable
-    ### echo "${LUKS_PASSWORD}" | cryptsetup luksOpen ${LVM_PARTITION} nixos-enc - # Does not work
-    cryptsetup luksOpen ${LVM_PARTITION} nixos-enc
-
-    # Create the LVM physical volume using nixos-enc
-    pvcreate /dev/mapper/nixos-enc 
-    
-    # Create a volume group that will contain our root and swap partitions
-    vgcreate nixos-vg /dev/mapper/nixos-enc
-
-    # Create a swap partition labeled "swap"
-    lvcreate -L ${SWAP_SIZE} -n swap nixos-vg
-
-    # Create a logical volume labeled "root" for the root filesystem
-    # using the remaining free space.
-    lvcreate -l "100%FREE" -n root nixos-vg
-
-    # Format boot partition with fat32
-    mkfs.vfat -n boot ${BOOT_PARTITION}
-
-    # Format root partition as ext4
-    mkfs.ext4 -L nixos /dev/nixos-vg/root
-
-    # Create swap file system
-    mkswap -L swap /dev/nixos-vg/swap
-
-    # Switch swap on
-    swapon /dev/nixos-vg/swap
+  nixos-generate-config --root /mnt
 }
 
-mount_fs_and_generate_config(){
-    
-    echo "Mount file system and generater configuration file"
-    
-    mount /dev/nixos-vg/root /mnt
-    mkdir /mnt/boot
-    mount $BOOT_PARTITION /mnt/boot
-    nixos-generate-config --root /mnt
-}
+patch_cfg() {
+  echo ">>> Patching ${TMP_CFG} for erase-your-darlings"
 
-adapt_config(){
-    # Makes some very minor adaptions to the configuration
-    # file. Should later be further extended after installation has
-    # finished.
-    
-    echo "Adapting ${TMP_CONFIG_PATH}"
-    
-    # Remove the closing curly bracket
-    sed -i "s/^}//" ${TMP_CONFIG_PATH} 
-    
-    cat << EOF >> ${TMP_CONFIG_PATH}
-# LVM needs to be descrypted 
-boot.initrd.luks.devices = {
-  root = { 
-    device = "${LVM_PARTITION}";
-    preLVM = true;
-  };
+  # Strip the trailing } in auto-generated config - we'll add it back later
+  sed -i '$ d' "${TMP_CFG}"
+
+cat >> "${TMP_CFG}" <<'NIX'
+###############################################################################
+#  Btrfs-erase-your-darlings boilerplate – auto-generated
+###############################################################################
+
+# ZRAM swap instead of a swap partition
+services.zramSwap = {
+  enable = true;
+  algorithm = zstd;
+  memoryPercent = 25; # lower if you've got lots of RAM
+  priority = 100;
 };
 
-EOF
+fileSystems."/" = {
+  device = "/dev/mapper/cryptroot";
+  options = [ "subvol=@root" "compress=zstd" "noatime" ];
+  fsType = "btrfs";
+};
 
-    cat << EOF >> ${TMP_CONFIG_PATH}
+fileSystems."/nix" = {
+  device = "/dev/mapper/cryptroot";
+  options = [ "subvol=@nix" "compress=zstd" "noatime" ];
+  fsType = "btrfs";
+};
+
+fileSystems."/persist" = {
+  device = "/dev/mapper/cryptroot";
+  options = [ "subvol=@persist" "compress=zstd" "noatime" ];
+  fsType = "btrfs";
+  neededForBoot = true;
+};
+
+fileSystems."/var/log" = {
+  device = "/dev/mapper/cryptroot";
+  options = [ "subvol=@log" "compress=zstd" "noatime" ];
+  fsType = "btrfs";
+};
+
+# Make critical paths persistent by bind-mounting them into /persist
+environment.etc."/nixos".source = "/persist/etc/nixos";
+environment.persistence."/persist" = {
+  directories = [
+    "/var/lib/bluetooth"
+    "/var/lib/systemd/coredump"
+    "/var/lib/NetworkManager"     # wifi credentials
+    "/home"
+  ];
+  files = [
+    "/etc/machine-id"
+  ];
+};
+
+boot.initrd.luks.devices."cryptroot".device = "/dev/disk/by-partlabel/cryptroot";
+
+networking.hostName = "${HOSTNAME}";
 networking.networkmanager.enable = true;
 
-EOF
-
-    cat << EOF >> ${TMP_CONFIG_PATH}
-users.extraUsers.${USER_NAME} = {
-  createHome = true;
-  extraGroups = ["wheel" "video" "audio" "disk" "networkmanager"];
-  group = "users";
-  home = "/home/${USER_NAME}";
+users.users.${USERNAME} = {
   isNormalUser = true;
-  uid = 1000;
+  extraGroups = [ "wheel" "networkmanager" ];
 };
 
-EOF
+nix.settings.experimental-features = [ "nix-command" "flakes" ];
 
-    cat << EOF >> ${TMP_CONFIG_PATH}
-services.xserver = {
-    enable = true;
-    autorun = true;
-    layout = "de";
+###############################################################################
+NIX
 
-    desktopManager = {
-      xterm.enable = false;
-    };
-   
-    displayManager = {
-        defaultSession = "none+i3";
-	lightdm.enable = true;
-    };
-
-    windowManager.i3 = {
-      enable = true;
-    };
-};
-
-EOF
-    
-    # Add closing curly bracekt
-    echo "}" >> ${TMP_CONFIG_PATH}
-    
-}
-    
-install_nixos(){
-
-    echo "Install NixOS"
-    
-    nixos-install
-    echo "Done - will reboot in 10 sec"
-    sleep 10
-    reboot
+  echo "}" >> "${TMP_CFG}"
 }
 
-main "$@"
+install() {
+  echo ">>> Installing NixOS (grab coffee…)"
+  nixos-install --no-root-passwd
+  echo ">>> Done. Rebooting in 5 s."
+  sleep 5
+  reboot
+}
+
+###############################################################################
+all() { partitions; luks; format; mount; patch_cfg; install; }
+
+###############################################################################
+# Entry-point
+###############################################################################
+if [[ $# -eq 0 ]]; then
+  print_help
+  exit 1
+fi
+
+for stage in "$@"; do
+  "$stage"
+done
